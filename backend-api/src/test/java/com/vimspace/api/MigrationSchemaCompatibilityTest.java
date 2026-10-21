@@ -1,6 +1,8 @@
 package com.vimspace.api;
 
+import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
+import jakarta.persistence.JoinColumn;
 import jakarta.persistence.Table;
 import jakarta.persistence.metamodel.Attribute;
 import jakarta.persistence.metamodel.EntityType;
@@ -74,7 +76,8 @@ class MigrationSchemaCompatibilityTest {
                     continue;
                 }
 
-                String columnName = toColumnName(attribute);
+                String columnName = columnNameOf(entityClass, attribute);
+                ColumnInfo info = columnInfo(entityClass, attribute);
 
                 String declaredType = sqlColumns.get(columnName);
                 if (declaredType == null) {
@@ -83,7 +86,7 @@ class MigrationSchemaCompatibilityTest {
                     continue;
                 }
 
-                String expectedType = expectedSqlType(attribute.getJavaType(), attribute.isAssociation());
+                String expectedType = expectedSqlType(attribute.getJavaType(), attribute.isAssociation(), info);
                 String declaredBase = stripLength(declaredType);
                 String expectedBase = stripLength(expectedType);
                 if (!expectedBase.equalsIgnoreCase(declaredBase)) {
@@ -93,10 +96,7 @@ class MigrationSchemaCompatibilityTest {
                 }
 
                 boolean sqlNullable = SQL_NULLABLE.get(tableName).get(columnName);
-                boolean jpaNullable = false;
-                if (attribute instanceof jakarta.persistence.metamodel.SingularAttribute singular) {
-                    jpaNullable = singular.isOptional();
-                }
+                boolean jpaNullable = nullableOf(attribute, info);
                 if (sqlNullable != jpaNullable) {
                     problems.add("Column '" + tableName + "." + columnName + "' nullability differs: "
                             + (sqlNullable ? "NULL" : "NOT NULL") + " in the migrations vs "
@@ -131,10 +131,21 @@ class MigrationSchemaCompatibilityTest {
         assertTrue(SQL_COLUMNS.get("sales").containsKey("session_id"),
                 "sales.session_id is missing from the migrations");
     }
-    private static String expectedSqlType(Class<?> javaType, boolean isAssociation) {
+    private static String expectedSqlType(Class<?> javaType, boolean isAssociation, ColumnInfo info) {
         if (isAssociation) {
             // All surrogate keys in this schema are Long / BIGINT.
             return "BIGINT";
+        }
+        if (info != null) {
+            if (javaType == String.class) {
+                int length = info.length();
+                return "VARCHAR(" + (length > 0 ? length : 255) + ")";
+            }
+            if (javaType == java.math.BigDecimal.class) {
+                if (info.precision() > 0 && info.scale() >= 0) {
+                    return "DECIMAL(" + info.precision() + "," + info.scale() + ")";
+                }
+            }
         }
         return switch (javaType.getName()) {
             case "java.lang.String" -> "VARCHAR(255)";
@@ -153,12 +164,59 @@ class MigrationSchemaCompatibilityTest {
         return paren >= 0 ? sqlType.substring(0, paren) : sqlType;
     }
 
-    /** Hibernate's implicit naming strategy: camelCase attribute -> snake_case column. */
-    private static String toColumnName(Attribute<?, ?> attribute) {
-        String name = attribute.getName();
+    private static record ColumnInfo(String name, int length, int precision, int scale, boolean nullable) {}
+
+    private static ColumnInfo columnInfo(Class<?> entityClass, Attribute<?, ?> attribute) {
+        try {
+            var field = entityClass.getDeclaredField(attribute.getName());
+            Column col = field.getAnnotation(Column.class);
+            if (col != null) {
+                return new ColumnInfo(
+                        col.name().isEmpty() ? attribute.getName() : col.name(),
+                        col.length(),
+                        col.precision(),
+                        col.scale(),
+                        col.nullable());
+            }
+            JoinColumn jc = field.getAnnotation(JoinColumn.class);
+            if (jc != null) {
+                return new ColumnInfo(
+                        jc.name().isEmpty() ? attribute.getName() : jc.name(),
+                        255, 0, 0, jc.nullable());
+            }
+        } catch (NoSuchFieldException e) {
+            return null;
+        }
+        return null;
+    }
+
+    private static String columnNameOf(Class<?> entityClass, Attribute<?, ?> attribute) {
+        ColumnInfo info = columnInfo(entityClass, attribute);
+        if (info != null && !info.name().isEmpty()) {
+            return info.name();
+        }
+        // Fallback: Hibernate implicit naming (camelCase -> snake_case)
+        String base = toSnakeCase(attribute.getName());
+        if (attribute.isAssociation()) {
+            base = base + "_id";
+        }
+        return base;
+    }
+
+    private static boolean nullableOf(Attribute<?, ?> attribute, ColumnInfo info) {
+        if (info != null) {
+            return info.nullable();
+        }
+        if (attribute instanceof jakarta.persistence.metamodel.SingularAttribute singular) {
+            return singular.isOptional();
+        }
+        return true;
+    }
+
+    private static String toSnakeCase(String camelCase) {
         StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < name.length(); i++) {
-            char c = name.charAt(i);
+        for (int i = 0; i < camelCase.length(); i++) {
+            char c = camelCase.charAt(i);
             if (Character.isUpperCase(c)) {
                 if (sb.length() > 0) {
                     sb.append('_');
@@ -168,12 +226,7 @@ class MigrationSchemaCompatibilityTest {
                 sb.append(c);
             }
         }
-        String base = sb.toString();
-        if (attribute.isAssociation()) {
-            // FK column: {attribute}_{referenced_pk_column}; all PKs are named "id".
-            base = base + "_id";
-        }
-        return base;
+        return sb.toString();
     }
 
     private static Path findMigrationsDir() {
@@ -210,7 +263,7 @@ class MigrationSchemaCompatibilityTest {
     private static final Pattern ALTER_TABLE_ADD =
             Pattern.compile("(?i)ALTER\\s+TABLE\\s+(\\w+)\\s+ADD\\s+(\\w+)\\s+(.+)");
     private static final Pattern COLUMN_DEFINITION =
-            Pattern.compile("(?i)^(\\w+)\\s+([A-Za-z]+)(\\s*\\([^)]*\\))?\\s*(.*)$");
+            Pattern.compile("(?i)^(\\w+)\\s+([A-Za-z0-9]+)(\\s*\\([^)]*\\))?\\s*(.*)$");
 
     private static final List<String> CONSTRAINT_KEYWORDS = List.of(
             "PRIMARY", "UNIQUE", "CONSTRAINT", "FOREIGN", "CHECK", "INDEX", "KEY");
